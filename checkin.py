@@ -2,19 +2,35 @@
 # -*- coding: utf-8 -*-
 """
 WorkBuddy 每日自动签到（无头版，供 GitHub Actions / 任务计划程序调用）
+=====================================================================
+适配 2026-10 版接口（WorkBuddy 5.7.x）。
 
-接口契约（实测于 copilot.tencent.com，token 为 Keycloak 签发的 JWT）：
-  POST https://copilot.tencent.com/v2/billing/meter/daily-checkin
-  Headers: Authorization: Bearer <JWT>, Content-Type: application/json
-  返回示例:
-    今日已签 -> {"code":10001,"msg":"今天已签到，请明天再来",...}
-    签到成功 -> {"code":0,"msg":"签到成功",...}  (含积分/连续天数)
+接口契约（2026-10 实测）
+------------------------
+  POST /v2/billing/meter/checkin-activity-status   查询签到状态
+  POST /v2/billing/meter/daily-checkin             执行签到（幂等）
 
-账号来源（二选一）：
-  1) 环境变量 WORKBUDDY_ACCOUNTS：完整 JSON，形如 {"accounts":[{"name":..,"token":..},...]}
-  2) 本地文件 accounts.json / 签到token.json（存在时自动读取，便于本地调试）
+  必需请求头：
+      Authorization: Bearer <JWT>
+      X-User-Id:  <uid>              ← 2026-10 新增；缺失 → 网关 401
+      X-Domain:   www.workbuddy.cn   ← 2026-10 新增；缺失 → 网关 401
+      User-Agent: 浏览器 UA           ← 服务端校验；用脚本默认 UA 会被拦
+
+  返回示例：
+      已签到 -> {"code":10001,"msg":"今天已签到，请明天再来"}
+      成功   -> {"code":0,"msg":"签到成功",...}
+
+账号来源（二选一）
+------------------
+  1) 环境变量 WORKBUDDY_ACCOUNTS：形如 {"accounts":[{"name":..,"token":..},...]}
+  2) 本地文件 accounts.json / 签到token.json（便于本地调试）
+
+  uid 若账号里没给，会自动从 JWT 的 sub 解出，**无需手工填**。
+
+依赖: requests
 """
 
+import base64
 import json
 import os
 import sys
@@ -22,10 +38,12 @@ import sys
 import requests
 
 API_HOST = "https://copilot.tencent.com"
+STATUS_URL = API_HOST + "/v2/billing/meter/checkin-activity-status"
 CHECKIN_URL = API_HOST + "/v2/billing/meter/daily-checkin"
+X_DOMAIN = "www.workbuddy.cn"
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 
 def load_accounts():
@@ -47,19 +65,32 @@ def load_accounts():
     return []
 
 
-def build_headers(token):
+def uid_from_token(token):
+    """从 JWT payload 的 sub 解出 uid；失败返回空串。"""
+    try:
+        seg = token.split(".")[1]
+        seg += "=" * (-len(seg) % 4)
+        return json.loads(base64.urlsafe_b64decode(seg)).get("sub", "") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def build_headers(token, uid=""):
+    uid = uid or uid_from_token(token)
     return {
         "Authorization": "Bearer %s" % token,
         "Content-Type": "application/json",
         "Accept": "application/json",
         "User-Agent": UA,
+        "X-User-Id": uid,            # 2026-10 新增，必需
+        "X-Domain": X_DOMAIN,        # 2026-10 新增，必需
         "Origin": API_HOST,
         "Referer": API_HOST + "/",
     }
 
 
 def classify(resp):
-    """把 HTTP 响应归类为 (status, detail)。status ∈ ok / already / expired / failed。"""
+    """把响应归类为 (status, detail)。status ∈ ok / already / expired / failed。"""
     try:
         data = resp.json()
     except Exception:  # noqa: BLE001
@@ -74,8 +105,9 @@ def classify(resp):
         return "already", (msg or "今日已签")
     if any(k in msg for k in ("失效", "过期", "无效", "expired", "invalid")):
         return "expired", (msg or "Token 失效")
+    if resp.status_code == 401:
+        return "expired", "HTTP 401（token 失效或缺少 X-User-Id / X-Domain）"
     if resp.status_code == 200:
-        # 其他 200 且非明确成功：保守当作已签，避免重复打扰
         return "already", (msg or "今日已签(推断)")
     return "failed", "HTTP %s %s" % (resp.status_code, msg or resp.text[:120])
 
@@ -88,8 +120,8 @@ def do_checkin(acct):
     try:
         resp = requests.post(
             CHECKIN_URL,
-            headers=build_headers(token),
-            json={},
+            headers=build_headers(token, acct.get("uid", "")),
+            json=[],
             timeout=25,
         )
     except Exception as e:  # noqa: BLE001
