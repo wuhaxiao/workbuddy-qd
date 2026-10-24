@@ -328,6 +328,9 @@ def main():
         sys.exit(1)
 
     print("=== 开始签到，共 %d 个账号 ===" % len(accounts))
+    # 一眼看出云端能不能自主续期（缺 GH_PAT 时会退化成只签到，不续期）
+    print("自动续期: %s" % ("已启用（可回写 Secret）"
+                          if can_persist() else "未启用（缺 GH_PAT / GH_REPO / pynacl）"))
     lines = []
     summary = {"ok": 0, "already": 0, "expired": 0, "failed": 0}
     renewed = 0
