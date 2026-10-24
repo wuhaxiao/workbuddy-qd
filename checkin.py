@@ -128,6 +128,23 @@ def renew(refresh_token, domain=X_DOMAIN):
     return data, None
 
 
+def can_persist():
+    """能否在续期后把新 refresh token 写回仓库 Secret。
+
+    必须能回写才允许在云端续期：refresh token 是轮换式的，
+    续期一次旧值就作废，若写不回去，下一轮必然 invalid_grant 断链。
+    """
+    if not (os.environ.get("GH_PAT") or "").strip():
+        return False
+    if not (os.environ.get("GH_REPO") or "").strip():
+        return False
+    try:
+        import nacl  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
 def ensure_token(acct):
     """确保账号有可用 accessToken；快过期则自动续期。
 
@@ -144,6 +161,10 @@ def ensure_token(acct):
     if not rt:
         # 没有 refresh token：只能硬着头皮试，过期就会 401
         return (True, "") if tok else (False, "既无 token 也无 refreshToken")
+
+    # 关键闸门：写不回 Secret 就绝不续期，避免把唯一有效的 refresh token 作废
+    if not can_persist():
+        return False, "该账号需续期，但云端无法回写 Secret（未配 GH_PAT）——请本地 python wb_renew.py"
 
     data, err = renew(rt, acct.get("domain") or X_DOMAIN)
     if err:
