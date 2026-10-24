@@ -47,6 +47,10 @@ X_DOMAIN = "www.workbuddy.cn"
 # accessToken 剩不到这么多秒就先续期（避免签到时正好过期）
 RENEW_AHEAD_SEC = 3 * 86400
 
+# 一旦某次 Secret 回写失败就置 False，后续账号不再续期：
+# refresh token 是轮换式的，续期了却写不回 = 这条链当场作废，多轮换一个多废一个。
+PERSIST_OK = True
+
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
@@ -134,6 +138,8 @@ def can_persist():
     必须能回写才允许在云端续期：refresh token 是轮换式的，
     续期一次旧值就作废，若写不回去，下一轮必然 invalid_grant 断链。
     """
+    if not PERSIST_OK:
+        return False
     if not (os.environ.get("GH_PAT") or "").strip():
         return False
     if not (os.environ.get("GH_REPO") or "").strip():
@@ -322,6 +328,7 @@ def mask(name):
 
 
 def main():
+    global PERSIST_OK
     accounts = load_accounts()
     if not accounts:
         print("[E] 没有可用账号，请配置 WORKBUDDY_ACCOUNTS 或本地 accounts.json")
@@ -340,6 +347,10 @@ def main():
         if ok and acct.get("_renewed"):
             renewed += 1
             print("♻️ %s: %s" % (mask(name), note))
+            # 立刻回写，而不是全部续完再一次性写：中途失败也只丢一个号
+            if push_secret(accounts) != "ok":
+                PERSIST_OK = False
+                print("[W] 新 refresh token 未能落盘，本轮停止继续续期（避免连带作废其它号）")
         if not ok:
             summary["expired"] += 1
             print("⚠️ %s: %s" % (mask(name), note))
@@ -357,8 +368,7 @@ def main():
     print(total)
     lines.append(total)
     if renewed:
-        print("本轮续期 %d 个账号，正在回写 Secret…" % renewed)
-        push_secret(accounts)
+        print("本轮续期 %d 个账号，Secret 已逐次回写。" % renewed)
     push("WorkBuddy 签到", "\n".join(lines))
 
 
