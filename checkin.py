@@ -45,7 +45,7 @@ RENEW_URL = API_HOST + "/v2/plugin/auth/token/refresh"
 X_DOMAIN = "www.workbuddy.cn"
 
 # accessToken 剩不到这么多秒就先续期（避免签到时正好过期）
-RENEW_AHEAD_SEC = 366 * 86400  # TESTMODE
+RENEW_AHEAD_SEC = 3 * 86400
 
 # 一旦某次 Secret 回写失败就置 False，后续账号不再续期：
 # refresh token 是轮换式的，续期了却写不回 = 这条链当场作废，多轮换一个多废一个。
