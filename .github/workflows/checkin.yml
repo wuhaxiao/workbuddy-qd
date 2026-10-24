@@ -36,4 +36,8 @@ jobs:
           WORKBUDDY_ACCOUNTS: ${{ secrets.WORKBUDDY_ACCOUNTS }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
+          # 以下两个用于 token 自动续期后把新 refresh token 写回 Secret
+          GH_PAT: ${{ secrets.GH_PAT }}
+          GH_REPO: ${{ github.repository }}
+          SECRET_NAME: WORKBUDDY_ACCOUNTS
         run: python checkin.py
