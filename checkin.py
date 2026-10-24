@@ -34,13 +34,18 @@ import base64
 import json
 import os
 import sys
+import time
 
 import requests
 
 API_HOST = "https://copilot.tencent.com"
 STATUS_URL = API_HOST + "/v2/billing/meter/checkin-activity-status"
 CHECKIN_URL = API_HOST + "/v2/billing/meter/daily-checkin"
+RENEW_URL = API_HOST + "/v2/plugin/auth/token/refresh"
 X_DOMAIN = "www.workbuddy.cn"
+
+# accessToken 剩不到这么多秒就先续期（避免签到时正好过期）
+RENEW_AHEAD_SEC = 3 * 86400
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
@@ -73,6 +78,138 @@ def uid_from_token(token):
         return json.loads(base64.urlsafe_b64decode(seg)).get("sub", "") or ""
     except Exception:  # noqa: BLE001
         return ""
+
+
+def token_exp(token):
+    """解出 JWT 的 exp 时间戳；失败返回 0。"""
+    try:
+        seg = token.split(".")[1]
+        seg += "=" * (-len(seg) % 4)
+        return int(json.loads(base64.urlsafe_b64decode(seg)).get("exp") or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+# ─── 离线续期 ────────────────────────────────────────
+def renew(refresh_token, domain=X_DOMAIN):
+    """用 refresh token 换新的 accessToken / refreshToken。
+
+    走客户端同款业务接口，无需 client_secret：
+        POST /v2/plugin/auth/token/refresh
+        X-Domain / X-Refresh-Token / X-Auth-Refresh-Source: plugin
+
+    返回 (data, err)。注意 refreshToken 每次都会轮换，旧值立即作废。
+    """
+    if not refresh_token:
+        return None, "refresh token 为空"
+    headers = {
+        "X-Domain": domain or X_DOMAIN,
+        "X-Refresh-Token": refresh_token,
+        "X-Auth-Refresh-Source": "plugin",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": UA,
+    }
+    try:
+        resp = requests.post(RENEW_URL, headers=headers, data="{}", timeout=25)
+    except Exception as e:  # noqa: BLE001
+        return None, "网络错误: %s" % e
+    if resp.status_code != 200:
+        return None, "HTTP %s" % resp.status_code
+    try:
+        body = resp.json()
+    except Exception:  # noqa: BLE001
+        return None, "响应非 JSON"
+    if body.get("code") != 0:
+        return None, "code=%s %s" % (body.get("code"), body.get("msg"))
+    data = body.get("data") or {}
+    if not data.get("accessToken"):
+        return None, "响应缺少 accessToken"
+    return data, None
+
+
+def ensure_token(acct):
+    """确保账号有可用 accessToken；快过期则自动续期。
+
+    返回 (ok, note)。续期成功时会在 acct 上打 _renewed 标记，
+    以便主流程在结束时把轮换后的 refresh token 写回 Secret。
+    """
+    tok = acct.get("token") or ""
+    rt = acct.get("refreshToken") or acct.get("rt") or ""
+    exp = token_exp(tok)
+    now = time.time()
+
+    if tok and exp and exp - now > RENEW_AHEAD_SEC:
+        return True, ""
+    if not rt:
+        # 没有 refresh token：只能硬着头皮试，过期就会 401
+        return (True, "") if tok else (False, "既无 token 也无 refreshToken")
+
+    data, err = renew(rt, acct.get("domain") or X_DOMAIN)
+    if err:
+        return False, "续期失败: %s" % err
+    acct["token"] = data["accessToken"]
+    acct["refreshToken"] = data.get("refreshToken") or rt
+    acct["_renewed"] = True
+    return True, "已续期"
+
+
+def secret_payload(accounts):
+    """构造写回 Secret 用的精简 JSON（只保留必要字段）。"""
+    out = []
+    for a in accounts:
+        out.append({
+            "name": a.get("name", ""),
+            "token": a.get("token", ""),
+            "refreshToken": a.get("refreshToken") or a.get("rt") or "",
+        })
+    return json.dumps({"accounts": out}, ensure_ascii=False, separators=(",", ":"))
+
+
+def push_secret(accounts):
+    """把续期后的账号写回仓库 Secret（需要 GH_PAT + GH_REPO）。
+
+    失败只告警不中断：签到本身已经完成，Secret 留到下次本地同步再修。
+    """
+    pat = (os.environ.get("GH_PAT") or "").strip()
+    repo = (os.environ.get("GH_REPO") or "").strip()
+    if not pat or not repo:
+        print("[i] 未配置 GH_PAT/GH_REPO，跳过 Secret 回写（续期结果本次有效）")
+        return "skipped"
+    try:
+        from nacl import public
+    except ImportError:
+        print("[W] 缺少 pynacl，无法回写 Secret（pip install pynacl）")
+        return "no-pynacl"
+
+    api = "https://api.github.com/repos/%s/actions/secrets" % repo
+    hdr = {"Authorization": "Bearer %s" % pat,
+           "Accept": "application/vnd.github+json",
+           "X-GitHub-Api-Version": "2022-11-28"}
+    name = os.environ.get("SECRET_NAME", "WORKBUDDY_ACCOUNTS")
+    try:
+        k = requests.get(api + "/public-key", headers=hdr, timeout=20)
+        if k.status_code != 200:
+            print("[W] 取得 Secret 公钥失败 HTTP %s" % k.status_code)
+            return "key-fail"
+        pk = k.json()
+
+        raw = base64.b64decode(pk["key"])
+        sealed = public.SealedBox(public.PublicKey(raw))
+        enc = base64.b64encode(sealed.encrypt(secret_payload(accounts).encode())).decode()
+
+        r = requests.put(api + "/" + name,
+                         headers=hdr,
+                         json={"encrypted_value": enc, "key_id": pk["key_id"]},
+                         timeout=20)
+        if r.status_code in (201, 204):
+            print("[i] 已把续期后的 token 写回 Secret %s" % name)
+            return "ok"
+        print("[W] 回写 Secret 失败 HTTP %s: %s" % (r.status_code, r.text[:160]))
+        return "fail"
+    except Exception as e:  # noqa: BLE001
+        print("[W] 回写 Secret 异常: %s" % e)
+        return "error"
 
 
 def build_headers(token, uid=""):
@@ -172,8 +309,18 @@ def main():
     print("=== 开始签到，共 %d 个账号 ===" % len(accounts))
     lines = []
     summary = {"ok": 0, "already": 0, "expired": 0, "failed": 0}
+    renewed = 0
     for acct in accounts:
         name = acct.get("name", "?")
+        ok, note = ensure_token(acct)
+        if ok and acct.get("_renewed"):
+            renewed += 1
+            print("♻️ %s: %s" % (mask(name), note))
+        if not ok:
+            summary["expired"] += 1
+            print("⚠️ %s: %s" % (mask(name), note))
+            lines.append("⚠️ %s: %s" % (name, note))
+            continue
         status, detail = do_checkin(acct)
         summary[status] += 1
         icon = {"ok": "✅", "already": "🟢", "expired": "⚠️", "failed": "❌"}[status]
@@ -185,6 +332,9 @@ def main():
              % (summary["ok"], summary["already"], summary["expired"], summary["failed"]))
     print(total)
     lines.append(total)
+    if renewed:
+        print("本轮续期 %d 个账号，正在回写 Secret…" % renewed)
+        push_secret(accounts)
     push("WorkBuddy 签到", "\n".join(lines))
 
 
