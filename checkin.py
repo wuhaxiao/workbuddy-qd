@@ -94,6 +94,82 @@ def token_exp(token):
         return 0
 
 
+# ─── 补丁 Secret：增量补号（不覆盖其它账号已轮换的 RT）──────────
+PATCH_ENV = "WORKBUDDY_PATCH"
+
+
+def load_patch():
+    """读补丁 Secret，格式 {"accounts":[{name,uid,token,refreshToken}]}。
+
+    应用成功后会被写成 {"applied":true,...}，这种直接当空补丁。
+    """
+    raw = os.environ.get(PATCH_ENV, "").strip()
+    if not raw:
+        return []
+    try:
+        j = json.loads(raw)
+    except Exception:  # noqa: BLE001
+        print("[W] %s 不是合法 JSON，忽略补丁" % PATCH_ENV, file=sys.stderr)
+        return []
+    if j.get("applied"):
+        return []
+    return j.get("accounts") or []
+
+
+def apply_patch(accounts):
+    """把补丁账号并进 accounts，返回被写入的账号名列表。
+
+    只改补丁点名的号，其余账号的 token / refreshToken 原样保留 ——
+    Secret 的值读不回来，本地那份很可能是作废的旧值，整体覆盖会断掉别人的链。
+
+    匹配规则（宁可不改也不改错）：
+      · 补丁带 uid → 只按 uid 前 8 位匹配，匹配不到就当新号追加
+      · 补丁无 uid → 仅在 accounts 里该 name 唯一时按 name 匹配
+        （两个号都叫"筱筱"这种，绝不按名字猜）
+    """
+    patch = load_patch()
+    if not patch:
+        return []
+
+    hit = []
+    for p in patch:
+        tok = (p.get("token") or "").strip()
+        if not tok:
+            continue
+        rt = (p.get("refreshToken") or p.get("rt") or "").strip()
+        uid = (p.get("uid") or uid_from_token(tok) or "").strip()
+        name = p.get("name") or uid
+
+        tgt = None
+        if uid:
+            key = uid.lower()[:8]
+            for a in accounts:
+                au = (a.get("uid") or "").lower()
+                if au and (au == uid.lower() or au[:8] == key):
+                    tgt = a
+                    break
+        elif name:
+            same = [a for a in accounts if a.get("name") == name]
+            if len(same) == 1:
+                tgt = same[0]
+            elif len(same) > 1:
+                print("[W] 补丁里的「%s」在现有账号中不唯一且未带 uid，跳过" % name)
+                continue
+
+        if tgt is None:
+            tgt = {"name": name}
+            accounts.append(tgt)
+
+        tgt["uid"] = tgt.get("uid") or uid
+        tgt["name"] = tgt.get("name") or name
+        tgt["token"] = tok
+        if rt:
+            tgt["rt"] = rt
+            tgt["refreshToken"] = rt
+        hit.append("%s(%s)" % (tgt.get("name"), (tgt.get("uid") or "")[:8]))
+    return hit
+
+
 # ─── 离线续期 ────────────────────────────────────────
 def renew(refresh_token, domain=X_DOMAIN):
     """用 refresh token 换新的 accessToken / refreshToken。
@@ -193,15 +269,13 @@ def secret_payload(accounts):
     return json.dumps({"accounts": out}, ensure_ascii=False, separators=(",", ":"))
 
 
-def push_secret(accounts):
-    """把续期后的账号写回仓库 Secret（需要 GH_PAT + GH_REPO）。
-
-    失败只告警不中断：签到本身已经完成，Secret 留到下次本地同步再修。
-    """
+def push_secret_value(name, value, quiet=False):
+    """把任意字符串写进仓库 Secret（需要 GH_PAT + GH_REPO）。"""
     pat = (os.environ.get("GH_PAT") or "").strip()
     repo = (os.environ.get("GH_REPO") or "").strip()
     if not pat or not repo:
-        print("[i] 未配置 GH_PAT/GH_REPO，跳过 Secret 回写（续期结果本次有效）")
+        if not quiet:
+            print("[i] 未配置 GH_PAT/GH_REPO，跳过 Secret 回写（续期结果本次有效）")
         return "skipped"
     try:
         from nacl import public
@@ -213,7 +287,6 @@ def push_secret(accounts):
     hdr = {"Authorization": "Bearer %s" % pat,
            "Accept": "application/vnd.github+json",
            "X-GitHub-Api-Version": "2022-11-28"}
-    name = os.environ.get("SECRET_NAME", "WORKBUDDY_ACCOUNTS")
     try:
         k = requests.get(api + "/public-key", headers=hdr, timeout=20)
         if k.status_code != 200:
@@ -223,20 +296,34 @@ def push_secret(accounts):
 
         raw = base64.b64decode(pk["key"])
         sealed = public.SealedBox(public.PublicKey(raw))
-        enc = base64.b64encode(sealed.encrypt(secret_payload(accounts).encode())).decode()
+        enc = base64.b64encode(sealed.encrypt(value.encode())).decode()
 
         r = requests.put(api + "/" + name,
                          headers=hdr,
                          json={"encrypted_value": enc, "key_id": pk["key_id"]},
                          timeout=20)
         if r.status_code in (201, 204):
-            print("[i] 已把续期后的 token 写回 Secret %s" % name)
+            if not quiet:
+                print("[i] 已把续期后的 token 写回 Secret %s" % name)
             return "ok"
-        print("[W] 回写 Secret 失败 HTTP %s: %s" % (r.status_code, r.text[:160]))
+        print("[W] 回写 Secret %s 失败 HTTP %s: %s" % (name, r.status_code, r.text[:160]))
         return "fail"
     except Exception as e:  # noqa: BLE001
         print("[W] 回写 Secret 异常: %s" % e)
         return "error"
+
+
+def push_secret(accounts):
+    """把账号列表整体写回主 Secret（WORKBUDDY_ACCOUNTS）。"""
+    name = os.environ.get("SECRET_NAME", "WORKBUDDY_ACCOUNTS")
+    return push_secret_value(name, secret_payload(accounts))
+
+
+def clear_patch():
+    """补丁已落盘后把它标记成 applied，避免下次重复合并。"""
+    return push_secret_value(PATCH_ENV,
+                             json.dumps({"applied": True, "at": int(time.time())}),
+                             quiet=True)
 
 
 def build_headers(token, uid=""):
@@ -338,6 +425,10 @@ def main():
     # 一眼看出云端能不能自主续期（缺 GH_PAT 时会退化成只签到，不续期）
     print("自动续期: %s" % ("已启用（可回写 Secret）"
                           if can_persist() else "未启用（缺 GH_PAT / GH_REPO / pynacl）"))
+
+    patched = apply_patch(accounts)
+    if patched:
+        print("[i] 补丁合并 %d 个账号：%s" % (len(patched), "、".join(patched)))
     lines = []
     summary = {"ok": 0, "already": 0, "expired": 0, "failed": 0}
     renewed = 0
@@ -369,6 +460,17 @@ def main():
     lines.append(total)
     if renewed:
         print("本轮续期 %d 个账号，Secret 已逐次回写。" % renewed)
+
+    # 补丁必须落盘到主 Secret 才算完成；写成功才清空，否则留着下轮重试
+    if patched:
+        if push_secret(accounts) == "ok":
+            if clear_patch() == "ok":
+                print("[i] 补丁已并入主 Secret，WORKBUDDY_PATCH 已清空")
+            else:
+                print("[W] 补丁已并入，但标记清空失败（下轮会重复合并，结果幂等，无害）")
+        else:
+            print("[W] 补丁未能写入主 Secret，保留待下轮重试")
+
     push("WorkBuddy 签到", "\n".join(lines))
 
 
