@@ -40,4 +40,6 @@ jobs:
           GH_PAT: ${{ secrets.GH_PAT }}
           GH_REPO: ${{ github.repository }}
           SECRET_NAME: WORKBUDDY_ACCOUNTS
+          # 增量补号通道：只合并补丁里点名的账号，不动其它号已轮换的 RT
+          WORKBUDDY_PATCH: ${{ secrets.WORKBUDDY_PATCH }}
         run: python checkin.py
