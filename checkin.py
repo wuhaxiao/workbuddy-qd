@@ -258,15 +258,41 @@ def ensure_token(acct):
 
 
 def secret_payload(accounts):
-    """构造写回 Secret 用的精简 JSON（只保留必要字段）。"""
+    """构造写回 Secret 用的精简 JSON。
+
+    必须带 uid：补丁按 uid 精确匹配，缺 uid 时补丁会误判成新号而追加成重复条目。
+    uid 缺失就从 token 的 sub 解出来补上。
+    """
     out = []
     for a in accounts:
+        tok = a.get("token", "")
         out.append({
             "name": a.get("name", ""),
-            "token": a.get("token", ""),
+            "uid": a.get("uid") or uid_from_token(tok),
+            "token": tok,
             "refreshToken": a.get("refreshToken") or a.get("rt") or "",
         })
     return json.dumps({"accounts": out}, ensure_ascii=False, separators=(",", ":"))
+
+
+def dedupe_accounts(accounts):
+    """同一账号出现多条时只留 accessToken 有效期最长的那条。
+
+    历史遗留：早期 Secret 不带 uid，补丁匹配不上就追加了一条，
+    导致同一个号既有 401 的旧 token 又有可用的新 token。
+    按 token 里的 sub 分组（sub 就是账号 uid），不按 name ——
+    两个号都可能叫"筱筱"，按名字去重会误删。
+    """
+    best = {}
+    for i, a in enumerate(accounts):
+        tok = (a.get("token") or "").strip()
+        key = (a.get("uid") or uid_from_token(tok) or a.get("name") or "").lower()
+        exp = token_exp(tok)
+        cur = best.get(key)
+        if cur is None or exp > cur[0]:
+            best[key] = (exp, i, a)
+    kept = [v[2] for v in sorted(best.values(), key=lambda x: x[1])]
+    return kept, len(accounts) - len(kept)
 
 
 def push_secret_value(name, value, quiet=False):
@@ -429,6 +455,10 @@ def main():
     patched = apply_patch(accounts)
     if patched:
         print("[i] 补丁合并 %d 个账号：%s" % (len(patched), "、".join(patched)))
+
+    accounts, dropped = dedupe_accounts(accounts)
+    if dropped:
+        print("[i] 去重：移除 %d 条重复或过期条目（同账号保留有效期最长的 token）" % dropped)
     lines = []
     summary = {"ok": 0, "already": 0, "expired": 0, "failed": 0}
     renewed = 0
@@ -461,15 +491,18 @@ def main():
     if renewed:
         print("本轮续期 %d 个账号，Secret 已逐次回写。" % renewed)
 
-    # 补丁必须落盘到主 Secret 才算完成；写成功才清空，否则留着下轮重试
-    if patched:
+    # 补丁/去重必须落盘到主 Secret 才算完成；写成功才清空补丁，否则留着下轮重试
+    if patched or dropped:
         if push_secret(accounts) == "ok":
-            if clear_patch() == "ok":
-                print("[i] 补丁已并入主 Secret，WORKBUDDY_PATCH 已清空")
+            if patched:
+                if clear_patch() == "ok":
+                    print("[i] 补丁已并入主 Secret，WORKBUDDY_PATCH 已清空")
+                else:
+                    print("[W] 补丁已并入，但标记清空失败（下轮会重复合并，结果幂等，无害）")
             else:
-                print("[W] 补丁已并入，但标记清空失败（下轮会重复合并，结果幂等，无害）")
+                print("[i] 主 Secret 已按去重结果重写")
         else:
-            print("[W] 补丁未能写入主 Secret，保留待下轮重试")
+            print("[W] 未能写入主 Secret，保留待下轮重试")
 
     push("WorkBuddy 签到", "\n".join(lines))
 
