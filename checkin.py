@@ -47,6 +47,11 @@ X_DOMAIN = "www.workbuddy.cn"
 # accessToken 剩不到这么多秒就先续期（避免签到时正好过期）
 RENEW_AHEAD_SEC = 3 * 86400
 
+# refreshToken 剩不到这么多秒也必须续期。
+# 实测：AT 可能是客户端自己刷新出来的（新鲜 30 天），而 RT 仍是 30 天前签发的，
+# 只剩 3 天。若只按 AT 判断，等触发续期时 RT 早已过期，直接 invalid_grant 断链。
+RT_RENEW_AHEAD_SEC = 7 * 86400
+
 # 一旦某次 Secret 回写失败就置 False，后续账号不再续期：
 # refresh token 是轮换式的，续期了却写不回 = 这条链当场作废，多轮换一个多废一个。
 PERSIST_OK = True
@@ -236,9 +241,14 @@ def ensure_token(acct):
     tok = acct.get("token") or ""
     rt = acct.get("refreshToken") or acct.get("rt") or ""
     exp = token_exp(tok)
+    rt_exp = token_exp(rt) if rt else 0
     now = time.time()
 
-    if tok and exp and exp - now > RENEW_AHEAD_SEC:
+    # 两个到期时间都要看。只看 AT 会漏：AT 可能是客户端刷新出来的（新鲜 30 天），
+    # 而 RT 还是 30 天前签发、只剩几天 —— 等 AT 快到期才续，RT 早死了。
+    at_ok = bool(tok and exp and exp - now > RENEW_AHEAD_SEC)
+    rt_ok = bool(rt and rt_exp - now > RT_RENEW_AHEAD_SEC)
+    if at_ok and rt_ok:
         return True, ""
     if not rt:
         # 没有 refresh token：只能硬着头皮试，过期就会 401
